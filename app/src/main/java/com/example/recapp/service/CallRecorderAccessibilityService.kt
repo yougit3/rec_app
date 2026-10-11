@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.SystemClock
 import android.telephony.TelephonyManager
 import android.util.Log
@@ -15,6 +16,7 @@ import com.example.recapp.R
 import com.example.recapp.RecApp
 import com.example.recapp.data.CallLogResolver
 import com.example.recapp.data.RecordingNaming
+import com.example.recapp.recorder.AudioSourceOption
 import com.example.recapp.recorder.CallRecorder
 import com.example.recapp.ui.MainActivity
 import java.io.File
@@ -33,11 +35,17 @@ import kotlinx.coroutines.withContext
 class CallRecorderAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    // 保存処理はサービス破棄後も完了させる必要があるため、scope とは別にキャンセルしない
+    private val saveScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val app get() = application as RecApp
     private lateinit var recorder: CallRecorder
     private lateinit var monitor: CallStateMonitor
+    private lateinit var callLog: CallLogResolver
 
     private var inCall = false
+    private var callSeq = 0
+    private var callLogBaselineId = 0L
     private var currentFile: File? = null
     private var startedAt = 0L
     private var startedElapsed = 0L
@@ -46,6 +54,7 @@ class CallRecorderAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         recorder = CallRecorder(this)
         monitor = CallStateMonitor(this, ::onCallStateChanged)
+        callLog = CallLogResolver(this)
         ensureMonitoring()
     }
 
@@ -75,8 +84,12 @@ class CallRecorderAccessibilityService : AccessibilityService() {
         when (state) {
             TelephonyManager.CALL_STATE_OFFHOOK -> if (!inCall) {
                 inCall = true
+                val seq = ++callSeq
                 scope.launch {
-                    if (app.settingsRepository.current().autoRecord) startRecording()
+                    val settings = app.settingsRepository.current()
+                    if (!settings.autoRecord) return@launch
+                    val baselineId = callLog.latestId()
+                    startRecording(seq, settings.audioSource, baselineId)
                 }
             }
             TelephonyManager.CALL_STATE_IDLE -> {
@@ -86,20 +99,19 @@ class CallRecorderAccessibilityService : AccessibilityService() {
         }
     }
 
-    private suspend fun startRecording() {
-        // 設定の読み込み中に通話が終了していれば録音しない
-        if (!inCall || recorder.isRecording) return
+    /** 中断を挟まずに呼ぶこと。待機中に通話が終了・再開した場合は seq の不一致で破棄する。 */
+    private fun startRecording(seq: Int, audioSource: AudioSourceOption, baselineId: Long) {
+        if (!inCall || seq != callSeq || recorder.isRecording) return
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             Log.w(TAG, "RECORD_AUDIO not granted")
             return
         }
-        val settings = app.settingsRepository.current()
-        if (!inCall) return
         startedAt = System.currentTimeMillis()
         startedElapsed = SystemClock.elapsedRealtime()
         val file = app.recordingRepository.newTempFile(startedAt)
-        if (recorder.start(file, settings.audioSource)) {
+        if (recorder.start(file, audioSource)) {
             currentFile = file
+            callLogBaselineId = baselineId
             showRecordingNotification()
         }
     }
@@ -111,14 +123,15 @@ class CallRecorderAccessibilityService : AccessibilityService() {
         cancelRecordingNotification()
         val durationMs = SystemClock.elapsedRealtime() - startedElapsed
         val callStartedAt = startedAt
-        scope.launch {
+        val baselineId = callLogBaselineId
+        saveScope.launch {
             withContext(NonCancellable) {
                 val settings = app.settingsRepository.current()
                 if (!ok || (settings.deleteShortRecordings && RecordingNaming.isTooShort(durationMs))) {
                     file.delete()
                     return@withContext
                 }
-                val info = CallLogResolver(this@CallRecorderAccessibilityService).resolve(callStartedAt)
+                val info = callLog.resolve(baselineId)
                 app.recordingRepository.save(
                     tempFile = file,
                     phoneNumber = info.phoneNumber,
@@ -132,7 +145,10 @@ class CallRecorderAccessibilityService : AccessibilityService() {
     }
 
     private fun showRecordingNotification() {
-        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+        // POST_NOTIFICATIONS は API 33 以降の実行時権限。それ未満では常に表示できる
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) return
         val contentIntent = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )

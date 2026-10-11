@@ -30,14 +30,20 @@ class RecordingListViewModel(application: Application) : AndroidViewModel(applic
         val wasPlaying = _playingId.value == recording.id
         stopPlayback()
         if (wasPlaying) return
+        val mp = MediaPlayer()
+        player = mp
         try {
-            player = MediaPlayer().apply {
-                setDataSource(recording.filePath)
-                setOnCompletionListener { stopPlayback() }
-                prepare()
-                start()
+            mp.setDataSource(recording.filePath)
+            mp.setOnCompletionListener { stopPlayback() }
+            mp.setOnPreparedListener {
+                if (player === mp) mp.start()
+            }
+            mp.setOnErrorListener { _, _, _ ->
+                stopPlayback()
+                true
             }
             _playingId.value = recording.id
+            mp.prepareAsync()
         } catch (e: Exception) {
             Log.w(TAG, "playback failed", e)
             stopPlayback()

@@ -19,7 +19,7 @@ class RecordingRepository(
     /** 録音開始時点では番号が未確定のため、仮の名前で作成し保存時にリネームする。 */
     fun newTempFile(startedAt: Long): File {
         recordingsDir.mkdirs()
-        return File(recordingsDir, RecordingNaming.fileName(startedAt, null).replace(".m4a", ".tmp.m4a"))
+        return File(recordingsDir, RecordingNaming.tempFileName(startedAt))
     }
 
     suspend fun save(
@@ -30,7 +30,7 @@ class RecordingRepository(
         startedAt: Long,
         durationMs: Long,
     ): Recording = withContext(Dispatchers.IO) {
-        val target = File(recordingsDir, RecordingNaming.fileName(startedAt, phoneNumber))
+        val target = uniqueTarget(RecordingNaming.fileName(startedAt, phoneNumber))
         val file = if (tempFile.renameTo(target)) target else tempFile
         val recording = Recording(
             filePath = file.absolutePath,
@@ -40,11 +40,28 @@ class RecordingRepository(
             startedAt = startedAt,
             durationMs = durationMs,
         )
-        recording.copy(id = dao.insert(recording))
+        try {
+            recording.copy(id = dao.insert(recording))
+        } catch (e: Exception) {
+            // 一覧に出せないファイルが残らないようにする
+            file.delete()
+            throw e
+        }
+    }
+
+    private fun uniqueTarget(name: String): File {
+        var target = File(recordingsDir, name)
+        var n = 1
+        while (target.exists()) {
+            target = File(recordingsDir, name.replace(".m4a", "_${n++}.m4a"))
+        }
+        return target
     }
 
     suspend fun delete(recording: Recording) = withContext(Dispatchers.IO) {
-        File(recording.filePath).delete()
+        val file = File(recording.filePath)
+        // ファイルが既に無い場合は DB の行だけ消す。削除に失敗したら行を残して再試行できるようにする
+        if (file.exists() && !file.delete()) return@withContext
         dao.delete(recording)
     }
 }
@@ -57,6 +74,9 @@ object RecordingNaming {
         val number = phoneNumber?.filter { it.isDigit() || it == '+' }?.takeIf { it.isNotEmpty() } ?: "unknown"
         return "${timestamp}_$number.m4a"
     }
+
+    fun tempFileName(startedAt: Long): String =
+        "${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(startedAt))}_recording.tmp"
 
     fun isTooShort(durationMs: Long): Boolean = durationMs < MIN_DURATION_MS
 }

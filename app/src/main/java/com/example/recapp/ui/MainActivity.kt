@@ -35,7 +35,10 @@ class MainActivity : ComponentActivity() {
                             state = state,
                             onPermissionsResult = ::refreshSetupState,
                             onDone = {
-                                nav.navigate(ROUTE_LIST) { popUpTo(ROUTE_SETUP) { inclusive = true } }
+                                // 設定画面から開いた場合は既存の一覧へ戻り、バックスタックを重複させない
+                                if (!nav.popBackStack(ROUTE_LIST, inclusive = false)) {
+                                    nav.navigate(ROUTE_LIST) { popUpTo(ROUTE_SETUP) { inclusive = true } }
+                                }
                             },
                         )
                     }
